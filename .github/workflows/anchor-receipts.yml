@@ -30,6 +30,7 @@ jobs:
           const { existsSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs");
           const { dirname } = require("node:path");
 
+          (async () => {
           const response = await fetch(process.env.PROOF_FEED_URL, {
             headers: { Accept: "application/json" },
             signal: AbortSignal.timeout(15_000),
@@ -125,6 +126,10 @@ jobs:
               flag: "wx",
             });
           }
+          })().catch((error) => {
+            console.error(error instanceof Error ? error.message : "Proof anchoring failed.");
+            process.exit(1);
+          });
           NODE
 
       - name: Commit receipts
