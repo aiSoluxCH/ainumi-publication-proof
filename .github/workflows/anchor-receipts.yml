@@ -1,0 +1,139 @@
+name: Anchor publication receipts
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publication-receipt-anchor
+  cancel-in-progress: false
+
+jobs:
+  anchor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+
+      - name: Fetch pending receipts
+        env:
+          PROOF_FEED_URL: https://app.ainumi.ch/api/publication-proofs/pending
+        run: |
+          node <<'NODE'
+          const { createHash } = require("node:crypto");
+          const { existsSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs");
+          const { dirname } = require("node:path");
+
+          const response = await fetch(process.env.PROOF_FEED_URL, {
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (!response.ok) {
+            console.log(`Proof feed unavailable (${response.status}); no changes.`);
+            process.exit(0);
+          }
+
+          const feed = await response.json();
+          if (
+            feed?.schemaVersion !== 1 ||
+            feed?.repository !== "aiSoluxCH/ainumi-publication-proof" ||
+            feed?.branch !== "main" ||
+            !Array.isArray(feed?.receipts)
+          ) {
+            throw new Error("Invalid proof feed contract.");
+          }
+
+          const hashPattern = /^[a-f0-9]{64}$/;
+          const pathPattern =
+            /^receipts\/v1\/\d{4}\/\d{2}\/\d{2}\/([a-f0-9]{64})\.json$/;
+          const uuidPattern =
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+          const receiptKeys = [
+            "auditEventId",
+            "canonicalPublicationJsonHash",
+            "eventHash",
+            "previousAuditEventHash",
+            "publicationId",
+            "publishedAt",
+            "schemaVersion",
+            "tradeId",
+          ].sort();
+
+          for (const candidate of feed.receipts) {
+            if (
+              typeof candidate?.path !== "string" ||
+              typeof candidate?.receiptJson !== "string" ||
+              candidate.receiptJson.length > 10_000
+            ) {
+              throw new Error("Invalid proof receipt envelope.");
+            }
+
+            const pathMatch = pathPattern.exec(candidate.path);
+            if (!pathMatch) {
+              throw new Error("Invalid proof receipt path.");
+            }
+
+            const receipt = JSON.parse(candidate.receiptJson);
+            const keys = Object.keys(receipt).sort();
+            if (
+              JSON.stringify(keys) !== JSON.stringify(receiptKeys) ||
+              receipt.schemaVersion !== 1 ||
+              !uuidPattern.test(receipt.auditEventId) ||
+              !uuidPattern.test(receipt.publicationId) ||
+              !uuidPattern.test(receipt.tradeId) ||
+              !hashPattern.test(receipt.canonicalPublicationJsonHash) ||
+              !hashPattern.test(receipt.eventHash) ||
+              (receipt.previousAuditEventHash !== null &&
+                !hashPattern.test(receipt.previousAuditEventHash)) ||
+              Number.isNaN(Date.parse(receipt.publishedAt)) ||
+              receipt.eventHash !== pathMatch[1]
+            ) {
+              throw new Error("Invalid proof receipt.");
+            }
+
+            const expectedEventHash = createHash("sha256")
+              .update(JSON.stringify({
+                auditEventId: receipt.auditEventId,
+                canonicalPublicationJsonHash:
+                  receipt.canonicalPublicationJsonHash,
+                previousAuditEventHash: receipt.previousAuditEventHash,
+                publicationId: receipt.publicationId,
+                publishedAt: receipt.publishedAt,
+                tradeId: receipt.tradeId,
+              }))
+              .digest("hex");
+            if (expectedEventHash !== receipt.eventHash) {
+              throw new Error("Invalid proof receipt hash.");
+            }
+
+            if (existsSync(candidate.path)) {
+              if (readFileSync(candidate.path, "utf8") !== candidate.receiptJson) {
+                throw new Error(`Immutable receipt conflict: ${candidate.path}`);
+              }
+              continue;
+            }
+
+            mkdirSync(dirname(candidate.path), { recursive: true });
+            writeFileSync(candidate.path, candidate.receiptJson, {
+              encoding: "utf8",
+              flag: "wx",
+            });
+          }
+          NODE
+
+      - name: Commit receipts
+        run: |
+          if git diff --quiet -- receipts; then
+            exit 0
+          fi
+          git config user.name "aiNumi Proof Bot"
+          git config user.email "proof-bot@users.noreply.github.com"
+          git add -- receipts
+          git commit -m "Anchor publication receipts"
+          git push origin main
